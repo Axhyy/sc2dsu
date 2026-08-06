@@ -10,8 +10,11 @@ permissions:
 
 jobs:
   check:
-    name: Lint, format, and build
-    runs-on: windows-latest
+    name: Lint, format, test, and build (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     # Skip PRs from forks: run on pushes by maintainers and PRs from same-repo branches only.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
@@ -25,11 +28,18 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux HID dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
 
       - name: cargo build (release)
-        run: cargo build --release --locked
+        run: cargo build --release

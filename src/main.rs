@@ -52,6 +52,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Mode {
     }
 }
 
+#[cfg(windows)]
 fn attach_console() {
     use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
     // SAFETY: AttachConsole/AllocConsole take no caller-supplied pointers; a failed
@@ -63,6 +64,9 @@ fn attach_console() {
         }
     }
 }
+
+#[cfg(not(windows))]
+fn attach_console() {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match parse_args() {

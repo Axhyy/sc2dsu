@@ -15,10 +15,12 @@ crc32fast = "1.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+eframe = "0.31"
+tray-icon = "0.19"
+
+[target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-nwg = { package = "native-windows-gui", version = "1" }
-nwd = { package = "native-windows-derive", version = "1" }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [build-dependencies]
 embed-manifest = "1"

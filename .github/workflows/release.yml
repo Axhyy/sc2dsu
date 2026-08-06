@@ -9,7 +9,14 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: sc2dsu-${{ github.ref_name }}-windows-x86_64.exe
+          - os: ubuntu-latest
+            artifact: sc2dsu-${{ github.ref_name }}-linux-x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,27 +26,49 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux HID dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Stage artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/sc2dsu.exe "dist/sc2dsu-${GITHUB_REF_NAME}.exe"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/sc2dsu.exe "dist/${{ matrix.artifact }}"
+          else
+            cp target/release/sc2dsu "dist/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/sc2dsu-*.exe
+          files: dist/sc2dsu-*
           generate_release_notes: true
           fail_on_unmatched_files: true
