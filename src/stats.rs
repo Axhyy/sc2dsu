@@ -11,6 +11,7 @@ pub static RECALIBRATE_REQUEST: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerSection {
     pub subscribers: usize,
+    pub controllers: usize,
     pub requests_per_sec: f32,
     pub samples_per_sec: f32,
     pub packets_per_sec: f32,
@@ -53,6 +54,7 @@ pub struct ServerStats {
 static LIVE: RwLock<ServerStats> = RwLock::new(ServerStats {
     server: ServerSection {
         subscribers: 0,
+        controllers: 0,
         requests_per_sec: 0.0,
         samples_per_sec: 0.0,
         packets_per_sec: 0.0,

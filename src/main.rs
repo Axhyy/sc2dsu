@@ -87,14 +87,14 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
     let dsu_wants_device = Arc::new(AtomicBool::new(false));
     let ui_wants_device = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel::<triton::ControllerState>(SAMPLE_QUEUE_LEN);
+    let (tx, rx) = sync_channel::<triton::DeviceEvent>(SAMPLE_QUEUE_LEN);
 
     let device_handle = {
         let dsu_wants = dsu_wants_device.clone();
         let ui_wants = ui_wants_device.clone();
         let shutdown = shutdown.clone();
         thread::Builder::new()
-            .name("triton-reader".into())
+            .name("controller-reader".into())
             .spawn(move || run_device_thread(dsu_wants, ui_wants, shutdown, tx))?
     };
 
@@ -110,7 +110,7 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
                     server.local_addr()?,
                     server.server_id()
                 );
-                eprintln!("waiting for client subscription before opening the controller ...");
+                eprintln!("waiting for client activity before opening controllers ...");
                 server.run()
             })?
     };
@@ -134,117 +134,193 @@ fn run_device_thread(
     dsu_wants: Arc<AtomicBool>,
     ui_wants: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    tx: SyncSender<triton::ControllerState>,
+    tx: SyncSender<triton::DeviceEvent>,
 ) {
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
     let mut api = match HidApi::new() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("triton: HidApi init failed: {e}");
+            eprintln!("controller: HidApi init failed: {e}");
             return;
         }
     };
 
+    let mut controllers = Vec::<ManagedController>::new();
+    let mut next_scan = Instant::now();
+
     while !shutdown.load(Ordering::Relaxed) {
         if !want_device() {
+            disconnect_all(&mut controllers, &tx);
             thread::sleep(Duration::from_millis(200));
+            next_scan = Instant::now();
             continue;
         }
 
-        if let Err(e) = api.refresh_devices() {
-            eprintln!("triton: refresh_devices failed ({e}); rebuilding HidApi");
-            match HidApi::new() {
-                Ok(a) => api = a,
-                Err(e) => {
-                    eprintln!("triton: HidApi re-init failed: {e}; backing off");
-                    thread::sleep(Duration::from_millis(1000));
-                    continue;
+        if Instant::now() >= next_scan {
+            if let Err(e) = api.refresh_devices() {
+                eprintln!("controller: refresh_devices failed ({e}); rebuilding HidApi");
+                match HidApi::new() {
+                    Ok(a) => api = a,
+                    Err(e) => {
+                        eprintln!("controller: HidApi re-init failed: {e}; backing off");
+                        thread::sleep(Duration::from_millis(1000));
+                        continue;
+                    }
                 }
             }
+            for info in triton::list_candidates(&api) {
+                let path = info.path().to_bytes().to_vec();
+                if controllers.iter().any(|controller| controller.path == path) {
+                    continue;
+                }
+                match triton::OpenSlot::open(&api, &info) {
+                    Ok(device) => {
+                        eprintln!(
+                            "controller: opened iface {} (PID {:04X} {})",
+                            device.interface_number,
+                            device.product_id,
+                            triton::pid_label(device.product_id),
+                        );
+                        controllers.push(ManagedController {
+                            path,
+                            device,
+                            dsu_slot: None,
+                            last_sample_at: Instant::now(),
+                            consecutive_errors: 0,
+                            last_imu_timestamp: None,
+                            stale_samples: 0,
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "controller: open iface {} (PID {:04X}) failed: {e}",
+                        info.interface_number(),
+                        info.product_id()
+                    ),
+                }
+            }
+            next_scan = Instant::now() + Duration::from_secs(1);
         }
 
-        let candidates = triton::list_candidates(&api);
-        if candidates.is_empty() {
-            thread::sleep(Duration::from_millis(500));
-            continue;
+        if stats::RECALIBRATE_REQUEST.swap(false, Ordering::Relaxed) {
+            for controller in &mut controllers {
+                controller.device.recalibrate();
+            }
         }
 
-        let mut slot = match triton::find_active_slot(&api, &candidates) {
-            Some(s) => {
-                eprintln!(
-                    "triton: opened slot iface {} (PID {:04X} {})",
-                    s.interface_number,
-                    s.product_id,
-                    triton::pid_label(s.product_id),
-                );
-                s
-            }
-            None => {
-                thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-
-        run_slot(&mut slot, &tx, &want_device, &shutdown);
-        eprintln!(
-            "triton: closing slot (dsu_wants={}, ui_wants={})",
-            dsu_wants.load(Ordering::Relaxed),
-            ui_wants.load(Ordering::Relaxed)
-        );
+        poll_controllers(&mut controllers, &tx);
+        thread::sleep(Duration::from_millis(2));
     }
+
+    disconnect_all(&mut controllers, &tx);
 }
 
-fn run_slot(
-    slot: &mut triton::OpenSlot,
-    tx: &SyncSender<triton::ControllerState>,
-    want_device: &impl Fn() -> bool,
-    shutdown: &AtomicBool,
+struct ManagedController {
+    path: Vec<u8>,
+    device: triton::OpenSlot,
+    dsu_slot: Option<u8>,
+    last_sample_at: Instant,
+    consecutive_errors: u32,
+    last_imu_timestamp: Option<u32>,
+    stale_samples: u32,
+}
+
+fn poll_controllers(
+    controllers: &mut Vec<ManagedController>,
+    tx: &SyncSender<triton::DeviceEvent>,
 ) {
     const SILENCE_REOPEN_MS: u128 = 2000;
     const STALE_THRESHOLD: u32 = 100;
 
-    let mut consecutive_errors = 0u32;
-    let mut last_sample_at = Instant::now();
-    let mut last_imu_ts: u32 = 0;
-    let mut stale_count: u32 = 0;
-    while want_device() && !shutdown.load(Ordering::Relaxed) {
-        match slot.read_one(50) {
+    let mut occupied = [false; triton::MAX_CONTROLLERS];
+    for controller in controllers.iter() {
+        if let Some(slot) = controller.dsu_slot {
+            occupied[usize::from(slot)] = true;
+        }
+    }
+
+    let mut index = 0;
+    while index < controllers.len() {
+        let mut remove = false;
+        match controllers[index].device.read_one(0) {
             Ok(Some(sample)) => {
-                consecutive_errors = 0;
-                last_sample_at = Instant::now();
-                if sample.imu.timestamp_us == last_imu_ts {
-                    stale_count += 1;
-                    if stale_count >= STALE_THRESHOLD {
+                controllers[index].consecutive_errors = 0;
+                controllers[index].last_sample_at = Instant::now();
+                let fresh_sample =
+                    controllers[index].last_imu_timestamp != Some(sample.imu.timestamp_us);
+                if !fresh_sample {
+                    controllers[index].stale_samples += 1;
+                    if controllers[index].stale_samples >= STALE_THRESHOLD {
                         eprintln!(
-                            "triton: IMU timestamp frozen for {} samples — Steam likely disabled IMU; reopening slot",
-                            STALE_THRESHOLD
+                            "controller: IMU timestamp frozen for {STALE_THRESHOLD} samples; reopening interface"
                         );
-                        return;
+                        remove = true;
                     }
                 } else {
-                    stale_count = 0;
-                    last_imu_ts = sample.imu.timestamp_us;
-                    let _ = tx.try_send(sample);
+                    controllers[index].last_imu_timestamp = Some(sample.imu.timestamp_us);
+                    controllers[index].stale_samples = 0;
+                }
+                if fresh_sample {
+                    let dsu_slot = match controllers[index].dsu_slot {
+                        Some(slot) => Some(slot),
+                        None => {
+                            let available = occupied
+                                .iter()
+                                .position(|used| !used)
+                                .map(|slot| slot as u8);
+                            if let Some(slot) = available {
+                                occupied[usize::from(slot)] = true;
+                                controllers[index].dsu_slot = Some(slot);
+                                eprintln!(
+                                    "controller: assigned PID {:04X} iface {} to DSU slot {}",
+                                    controllers[index].device.product_id,
+                                    controllers[index].device.interface_number,
+                                    slot
+                                );
+                            }
+                            available
+                        }
+                    };
+                    if let Some(slot) = dsu_slot {
+                        let _ = tx.try_send(triton::DeviceEvent::Sample {
+                            slot,
+                            state: sample,
+                        });
+                    }
                 }
             }
             Ok(None) => {
-                consecutive_errors = 0;
-                if last_sample_at.elapsed().as_millis() >= SILENCE_REOPEN_MS {
-                    eprintln!(
-                        "triton: no STATE reports for {} ms — Steam likely commandeered the device; reopening slot",
-                        SILENCE_REOPEN_MS
-                    );
-                    return;
+                controllers[index].consecutive_errors = 0;
+                if controllers[index].last_sample_at.elapsed().as_millis() >= SILENCE_REOPEN_MS {
+                    remove = true;
                 }
             }
             Err(e) => {
-                consecutive_errors += 1;
-                if consecutive_errors >= 5 {
-                    eprintln!("triton: 5 consecutive read errors ({e}); reopening slot");
-                    return;
+                controllers[index].consecutive_errors += 1;
+                if controllers[index].consecutive_errors >= 5 {
+                    eprintln!("controller: 5 consecutive read errors ({e}); reopening interface");
+                    remove = true;
                 }
             }
+        }
+
+        if remove {
+            let controller = controllers.remove(index);
+            if let Some(slot) = controller.dsu_slot {
+                occupied[usize::from(slot)] = false;
+                let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
+                eprintln!("controller: DSU slot {slot} disconnected");
+            }
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn disconnect_all(controllers: &mut Vec<ManagedController>, tx: &SyncSender<triton::DeviceEvent>) {
+    for controller in controllers.drain(..) {
+        if let Some(slot) = controller.dsu_slot {
+            let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
         }
     }
 }

@@ -85,7 +85,7 @@ pub struct App {
     #[nwg_control(parent: status_frame, position: (12, 54), size: (500, 18), text: "Server id:       —")]
     lbl_id: nwg::Label,
 
-    #[nwg_control(parent: status_frame, position: (12, 74), size: (500, 18), text: "Subscribers:     0     (controller idle)")]
+    #[nwg_control(parent: status_frame, position: (12, 74), size: (500, 18), text: "Controllers:     0     Subscribers: 0")]
     lbl_subs: nwg::Label,
 
     #[nwg_control(parent: status_frame, position: (12, 94), size: (500, 18), text: "IMU rate:        — Hz   →  packets sent —/s")]
@@ -464,9 +464,9 @@ impl App {
         self.lbl_id
             .set_text(&format!("Server id:       0x{:08X}", s.server.server_id));
         let device_state = if s.server.device_active {
-            "controller awake"
+            "controllers awake"
         } else {
-            "controller idle"
+            "controllers idle"
         };
         let cal_state: String = if !s.calibration.active {
             "gyro: off".into()
@@ -476,8 +476,8 @@ impl App {
             "gyro: calibrating…".into()
         };
         self.lbl_subs.set_text(&format!(
-            "Subscribers:     {}     ({device_state} · {cal_state})",
-            s.server.subscribers,
+            "Controllers:     {}     Subscribers: {}     ({device_state} · {cal_state})",
+            s.server.controllers, s.server.subscribers,
         ));
         self.lbl_rate.set_text(&format!(
             "IMU rate:        {:>6.1} Hz   →  packets sent {:>6.1}/s   reqs {:>4.1}/s",

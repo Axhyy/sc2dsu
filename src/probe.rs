@@ -3,14 +3,16 @@ use hidapi::HidApi;
 use std::time::{Duration, Instant};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("probe: initializing HIDAPI ...");
     let api = HidApi::new()?;
+    eprintln!("probe: HIDAPI ready");
 
     println!("=== All Valve (VID 0x28DE) HID interfaces ===");
     for d in api
         .device_list()
         .filter(|d| d.vendor_id() == triton::VID_VALVE)
     {
-        let cand = triton::is_triton_pid(d.product_id()) && d.usage_page() >= 0xFF00;
+        let cand = triton::is_candidate(d);
         let mark = if cand { "  <-- candidate" } else { "" };
         println!(
             "  PID {:04X} iface={:>2} usage_page=0x{:04X} usage=0x{:04X} serial={:?} product={:?}{}",
@@ -65,7 +67,10 @@ fn probe_one(mut slot: OpenSlot) {
             }
         }
     }
-    println!("    --- 3 s summary: {frames_seen} STATE frames decoded ---");
+    println!(
+        "    --- 3 s summary: {} raw input reports, {frames_seen} STATE frames decoded ---",
+        slot.input_reports_seen
+    );
 }
 
 fn print_sample(s: &ControllerState) {

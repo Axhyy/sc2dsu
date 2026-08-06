@@ -1,6 +1,6 @@
 use crate::config;
 use crate::stats;
-use crate::triton::{self, ControllerState};
+use crate::triton::{self, ControllerState, DeviceEvent};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::net::{SocketAddr, UdpSocket};
@@ -44,30 +44,49 @@ mod connection_type {
 }
 const BATTERY_NA: u8 = 0;
 
-const OUR_SLOT: u8 = 0;
-const OUR_MAC: [u8; 6] = [0x02, 0x28, 0xDE, 0x13, 0x04, OUR_SLOT];
+const MAX_SLOTS: usize = triton::MAX_CONTROLLERS;
+
+fn slot_mac(slot: u8) -> [u8; 6] {
+    [0x02, 0x28, 0xDE, 0x13, 0x04, slot]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SubscriptionKey {
+    client_id: u32,
+    reg_type: u8,
+    slot: u8,
+    mac: [u8; 6],
+}
 
 struct Subscriber {
     addr: SocketAddr,
     last_request: Instant,
-    packet_counter: u32,
+    packet_counters: [u32; MAX_SLOTS],
+}
+
+fn registration_wants_slot(registration: &SubscriptionKey, slot: u8) -> bool {
+    registration.reg_type == 0
+        || (registration.reg_type & 0b01 != 0 && registration.slot == slot)
+        || (registration.reg_type & 0b10 != 0 && registration.mac == slot_mac(slot))
 }
 
 pub struct Server {
     socket: UdpSocket,
     server_id: u32,
-    subscribers: HashMap<u32, Subscriber>,
+    subscribers: HashMap<SubscriptionKey, Subscriber>,
     dsu_wants_device: Arc<AtomicBool>,
+    last_device_interest: Option<Instant>,
     shutdown: Arc<AtomicBool>,
-    sample_rx: Receiver<ControllerState>,
+    sample_rx: Receiver<DeviceEvent>,
+    connected: [bool; MAX_SLOTS],
     last_gyro: [f32; 3],
     last_cleanup: Instant,
     last_stats: Instant,
     samples_in_window: u32,
     packets_in_window: u32,
     requests_in_window: u32,
-    orientation_q: [f32; 4],
-    last_sample_at: Option<Instant>,
+    orientation_q: [[f32; 4]; MAX_SLOTS],
+    last_sample_at: [Option<Instant>; MAX_SLOTS],
 }
 
 impl Server {
@@ -76,7 +95,7 @@ impl Server {
         expose_to_network: bool,
         dsu_wants_device: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
-        sample_rx: Receiver<ControllerState>,
+        sample_rx: Receiver<DeviceEvent>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind((config::bind_host(expose_to_network), port))?;
         socket.set_read_timeout(Some(RECV_TIMEOUT))?;
@@ -86,16 +105,18 @@ impl Server {
             server_id,
             subscribers: HashMap::new(),
             dsu_wants_device,
+            last_device_interest: None,
             shutdown,
             sample_rx,
+            connected: [false; MAX_SLOTS],
             last_gyro: [0.0; 3],
             last_cleanup: Instant::now(),
             last_stats: Instant::now(),
             samples_in_window: 0,
             packets_in_window: 0,
             requests_in_window: 0,
-            orientation_q: [1.0, 0.0, 0.0, 0.0],
-            last_sample_at: None,
+            orientation_q: [[1.0, 0.0, 0.0, 0.0]; MAX_SLOTS],
+            last_sample_at: [None; MAX_SLOTS],
         })
     }
 
@@ -141,30 +162,43 @@ impl Server {
     }
 
     fn pump_samples(&mut self) -> bool {
+        if stats::RECENTER_REQUEST.swap(false, Ordering::Relaxed) {
+            self.orientation_q = [[1.0, 0.0, 0.0, 0.0]; MAX_SLOTS];
+            self.last_sample_at = [None; MAX_SLOTS];
+        }
         loop {
             match self.sample_rx.try_recv() {
-                Ok(s) => {
+                Ok(DeviceEvent::Sample { slot, state: s }) => {
+                    let slot_index = usize::from(slot);
+                    if slot_index >= MAX_SLOTS {
+                        continue;
+                    }
+                    self.connected[slot_index] = true;
                     self.samples_in_window += 1;
                     self.last_gyro = s.imu.gyro_dps;
-                    self.broadcast_data_packet(&s);
-                    if stats::RECENTER_REQUEST.swap(false, Ordering::Relaxed) {
-                        self.orientation_q = [1.0, 0.0, 0.0, 0.0];
-                        self.last_sample_at = None;
-                    }
+                    self.broadcast_data_packet(slot, &s);
                     let now = Instant::now();
-                    let dt = match self.last_sample_at {
+                    let dt = match self.last_sample_at[slot_index] {
                         Some(t) => now.duration_since(t).as_secs_f32().min(0.1),
                         None => 0.0,
                     };
-                    self.last_sample_at = Some(now);
+                    self.last_sample_at[slot_index] = Some(now);
                     if dt > 0.0 {
-                        integrate_gyro(&mut self.orientation_q, s.imu.gyro_dps, dt);
+                        integrate_gyro(&mut self.orientation_q[slot_index], s.imu.gyro_dps, dt);
                     }
                     stats::publish_motion(stats::MotionSection {
                         last_gyro_dps: s.imu.gyro_dps,
                         last_accel_g: s.imu.accel_g,
-                        orientation: self.orientation_q,
+                        orientation: self.orientation_q[slot_index],
                     });
+                }
+                Ok(DeviceEvent::Disconnected { slot }) => {
+                    let slot_index = usize::from(slot);
+                    if slot_index < MAX_SLOTS {
+                        self.connected[slot_index] = false;
+                        self.orientation_q[slot_index] = [1.0, 0.0, 0.0, 0.0];
+                        self.last_sample_at[slot_index] = None;
+                    }
                 }
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => {
@@ -194,6 +228,11 @@ impl Server {
         );
         stats::publish_server(stats::ServerSection {
             subscribers: self.subscribers.len(),
+            controllers: self
+                .connected
+                .iter()
+                .filter(|&&connected| connected)
+                .count(),
             requests_per_sec: self.requests_in_window as f32 / secs,
             samples_per_sec: self.samples_in_window as f32 / secs,
             packets_per_sec: self.packets_in_window as f32 / secs,
@@ -243,9 +282,12 @@ impl Server {
     }
 
     fn handle_ports(&mut self, c: &mut Cursor<&[u8]>, src: SocketAddr) -> io::Result<()> {
-        let amount = read_u32_le(c)?.min(4) as usize;
+        let amount = read_u32_le(c)?.min(MAX_SLOTS as u32) as usize;
         let mut requested = vec![0u8; amount];
         c.read_exact(&mut requested)?;
+        if !requested.is_empty() {
+            self.mark_device_interest();
+        }
         for slot in requested {
             self.send_slot_info(src, slot)?;
         }
@@ -264,18 +306,24 @@ impl Server {
         c.read_exact(&mut mac)?;
 
         let wants_us = reg_type == 0
-            || (reg_type & 0b01 != 0 && slot == OUR_SLOT)
-            || (reg_type & 0b10 != 0 && mac == OUR_MAC);
+            || (reg_type & 0b01 != 0 && usize::from(slot) < MAX_SLOTS)
+            || (reg_type & 0b10 != 0
+                && (0..MAX_SLOTS).any(|candidate| mac == slot_mac(candidate as u8)));
         if !wants_us {
             return Ok(());
         }
-        if self.subscribers.len() >= MAX_SUBSCRIBERS && !self.subscribers.contains_key(&client_id) {
+        let key = SubscriptionKey {
+            client_id,
+            reg_type,
+            slot,
+            mac,
+        };
+        if self.subscribers.len() >= MAX_SUBSCRIBERS && !self.subscribers.contains_key(&key) {
             return Ok(());
         }
 
-        let was_empty = self.subscribers.is_empty();
         self.subscribers
-            .entry(client_id)
+            .entry(key)
             .and_modify(|s| {
                 s.addr = src;
                 s.last_request = Instant::now();
@@ -283,24 +331,32 @@ impl Server {
             .or_insert_with(|| Subscriber {
                 addr: src,
                 last_request: Instant::now(),
-                packet_counter: 0,
+                packet_counters: [0; MAX_SLOTS],
             });
-        if was_empty {
-            self.dsu_wants_device.store(true, Ordering::Relaxed);
-            eprintln!("dsu: first subscriber {client_id:08X} from {src} -> waking controller");
-        }
+        self.mark_device_interest();
         Ok(())
     }
 
     fn cleanup_subscribers(&mut self) {
-        let was_empty = self.subscribers.is_empty();
         let now = Instant::now();
         self.subscribers
             .retain(|_, s| now.duration_since(s.last_request) < CLIENT_TIMEOUT);
-        let is_empty = self.subscribers.is_empty();
-        if !was_empty && is_empty {
-            self.dsu_wants_device.store(false, Ordering::Relaxed);
-            eprintln!("dsu: last subscriber timed out -> releasing controller");
+        let recent_interest = self
+            .last_device_interest
+            .is_some_and(|last| now.duration_since(last) < CLIENT_TIMEOUT);
+        let should_be_awake = !self.subscribers.is_empty() || recent_interest;
+        let was_awake = self
+            .dsu_wants_device
+            .swap(should_be_awake, Ordering::Relaxed);
+        if was_awake && !should_be_awake {
+            eprintln!("dsu: client activity timed out -> releasing controllers");
+        }
+    }
+
+    fn mark_device_interest(&mut self) {
+        self.last_device_interest = Some(Instant::now());
+        if !self.dsu_wants_device.swap(true, Ordering::Relaxed) {
+            eprintln!("dsu: client request -> waking controllers");
         }
     }
 
@@ -316,27 +372,39 @@ impl Server {
     fn send_slot_info(&self, src: SocketAddr, slot: u8) -> io::Result<()> {
         let mut out = vec![0u8; HEADER_LEN_FULL + 12];
         write_header(&mut out, self.server_id, msg_type::PORTS);
-        write_controller_header(&mut out[HEADER_LEN_FULL..], slot);
+        let connected = self
+            .connected
+            .get(usize::from(slot))
+            .copied()
+            .unwrap_or(false);
+        write_controller_header(&mut out[HEADER_LEN_FULL..], slot, connected);
         finalize_crc(&mut out);
         self.socket.send_to(&out, src)?;
         Ok(())
     }
 
-    fn broadcast_data_packet(&mut self, sample: &ControllerState) {
+    fn broadcast_data_packet(&mut self, slot: u8, sample: &ControllerState) {
         if self.subscribers.is_empty() {
+            return;
+        }
+        let slot_index = usize::from(slot);
+        if slot_index >= MAX_SLOTS {
             return;
         }
         const PACKET_NUM_OFFSET: usize = HEADER_LEN_FULL + CONTROLLER_HEADER_LEN + 1;
 
         let mut out = vec![0u8; HEADER_LEN_FULL + 80];
         write_header(&mut out, self.server_id, msg_type::DATA);
-        write_controller_header(&mut out[HEADER_LEN_FULL..], OUR_SLOT);
+        write_controller_header(&mut out[HEADER_LEN_FULL..], slot, true);
         write_data_body(&mut out[HEADER_LEN_FULL + CONTROLLER_HEADER_LEN..], sample);
 
-        for sub in self.subscribers.values_mut() {
-            sub.packet_counter = sub.packet_counter.wrapping_add(1);
+        for (registration, sub) in &mut self.subscribers {
+            if !registration_wants_slot(registration, slot) {
+                continue;
+            }
+            sub.packet_counters[slot_index] = sub.packet_counters[slot_index].wrapping_add(1);
             out[PACKET_NUM_OFFSET..PACKET_NUM_OFFSET + 4]
-                .copy_from_slice(&sub.packet_counter.to_le_bytes());
+                .copy_from_slice(&sub.packet_counters[slot_index].to_le_bytes());
             finalize_crc(&mut out);
             match self.socket.send_to(&out, sub.addr) {
                 Ok(_) => self.packets_in_window += 1,
@@ -369,13 +437,13 @@ fn finalize_crc(out: &mut [u8]) {
     out[CRC_OFFSET..CRC_OFFSET + CRC_LEN].copy_from_slice(&crc.to_le_bytes());
 }
 
-fn write_controller_header(buf: &mut [u8], slot: u8) {
+fn write_controller_header(buf: &mut [u8], slot: u8, connected: bool) {
     buf[0] = slot;
-    if slot == OUR_SLOT {
+    if connected {
         buf[1] = slot_state::CONNECTED;
         buf[2] = device_type::GYRO_FULL;
         buf[3] = connection_type::USB;
-        buf[4..10].copy_from_slice(&OUR_MAC);
+        buf[4..10].copy_from_slice(&slot_mac(slot));
         buf[10] = BATTERY_NA;
     }
 }
@@ -686,5 +754,91 @@ mod tests {
         let mut q = [1.0f32, 0.0, 0.0, 0.0];
         integrate_gyro(&mut q, [0.0, 0.0, 0.0], 0.01);
         assert_eq!(q, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn controller_headers_encode_each_slot_and_connection_state() {
+        let mut connected = [0u8; CONTROLLER_HEADER_LEN];
+        write_controller_header(&mut connected, 2, true);
+        assert_eq!(connected[0], 2);
+        assert_eq!(connected[1], slot_state::CONNECTED);
+        assert_eq!(&connected[4..10], &slot_mac(2));
+
+        let mut disconnected = [0u8; CONTROLLER_HEADER_LEN];
+        write_controller_header(&mut disconnected, 3, false);
+        assert_eq!(disconnected[0], 3);
+        assert_eq!(&disconnected[1..], &[0; CONTROLLER_HEADER_LEN - 1]);
+    }
+
+    #[test]
+    fn registrations_are_filtered_per_slot_or_mac() {
+        let by_slot = SubscriptionKey {
+            client_id: 1,
+            reg_type: 1,
+            slot: 1,
+            mac: [0; 6],
+        };
+        assert!(!registration_wants_slot(&by_slot, 0));
+        assert!(registration_wants_slot(&by_slot, 1));
+
+        let by_mac = SubscriptionKey {
+            client_id: 1,
+            reg_type: 2,
+            slot: 0,
+            mac: slot_mac(3),
+        };
+        assert!(!registration_wants_slot(&by_mac, 2));
+        assert!(registration_wants_slot(&by_mac, 3));
+    }
+
+    #[test]
+    fn broadcast_routes_only_the_requested_dsu_slot() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+        let wants = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut server = Server::bind(0, false, wants, shutdown, rx).unwrap();
+        let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let registration = SubscriptionKey {
+            client_id: 7,
+            reg_type: 1,
+            slot: 1,
+            mac: [0; 6],
+        };
+        server.subscribers.insert(
+            registration,
+            Subscriber {
+                addr: client.local_addr().unwrap(),
+                last_request: Instant::now(),
+                packet_counters: [0; MAX_SLOTS],
+            },
+        );
+        let sample = ControllerState {
+            buttons: 0,
+            trigger_left: 0,
+            trigger_right: 0,
+            left_stick: [0; 2],
+            right_stick: [0; 2],
+            imu: triton::ImuSample {
+                timestamp_us: 1,
+                accel_g: [0.0; 3],
+                gyro_dps: [0.0; 3],
+            },
+        };
+
+        server.broadcast_data_packet(0, &sample);
+        let mut packet = [0u8; 128];
+        let err = client.recv(&mut packet).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+
+        server.broadcast_data_packet(1, &sample);
+        let received = client.recv(&mut packet).unwrap();
+        assert_eq!(received, HEADER_LEN_FULL + 80);
+        assert_eq!(packet[HEADER_LEN_FULL], 1);
     }
 }

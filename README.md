@@ -1,18 +1,25 @@
 # SC2DSU
 
-Cemuhook DSU server for the 2026 Steam Controller's gyro and accelerometer. Runs on `127.0.0.1:26760`. Steam Input handles buttons; this handles motion.
+Cemuhook DSU server for the original 2015 and 2026 Steam Controllers. It forwards motion, buttons, sticks, pads, and triggers to emulators such as Cemu, Eden, Citra, and Ryujinx on `127.0.0.1:26760`.
 
-Download `sc2dsu.exe` from [Releases](https://github.com/NightHammer1000/sc2dsu/releases) and run it. Plug in the Puck, point your emulator at `127.0.0.1:26760`, done. Only tested with Eden over the Proteus Puck.
+Download `sc2dsu.exe` from [Releases](https://github.com/NightHammer1000/sc2dsu/releases) and run it, then point your emulator at `127.0.0.1:26760`.
+
+Up to four connected controllers are exposed as DSU slots 0–3 in discovery order. Per-slot and per-MAC DSU subscriptions are both supported, so local multiplayer clients only receive the controller slots they request.
 
 If an axis is wrong, swap the source or flip invert in the settings window. Saved live; takes effect on the next IMU sample. Config lives at `%APPDATA%\sc2dsu\config.toml`.
 
 Run modes: `sc2dsu` (GUI + server), `sc2dsu --tray` (start hidden), `sc2dsu --headless` (server only, log to stderr), `sc2dsu --probe` (enumerate Valve HIDs and dump 3 s of decoded IMU).
 
-Only the Proteus Puck (`0x1304`) was actually plugged in during development. Wired (`0x1302`), BLE (`0x1303`), and Nereid Puck (`0x1305`) are listed in SDL's Triton driver as the same family, so the code path treats them identically but I have no idea if any of that actually works on real hardware. Reports welcome.
+Tested hardware:
+
+- 2015 Steam Controller over Bluetooth (`28DE:1106`)
+- 2026 Steam Controller over the Proteus Puck (`28DE:1304`)
+
+The SDL3-listed 2015 wired (`0x1102`), BLE (`0x1105`/`0x1106`), and wireless dongle (`0x1142`) transports are supported. Triton wired (`0x1302`), BLE (`0x1303`), Proteus (`0x1304`), and Nereid (`0x1305`) use the existing Triton path; transports not listed as tested above still need hardware reports.
 
 Build with `cargo build --release`. CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo build --release --locked` on every push.
 
-HID protocol from SDL3 [`SDL_hidapi_steam_triton.c`](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam_triton.c) and [steam/](https://github.com/libsdl-org/SDL/tree/main/src/joystick/hidapi/steam) headers. DSU protocol from [v1993/gcemuhook](https://github.com/v1993/gcemuhook). MIT.
+HID protocol from SDL3 [`SDL_hidapi_steam.c`](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam.c), [`SDL_hidapi_steam_triton.c`](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam_triton.c), and the [steam protocol headers](https://github.com/libsdl-org/SDL/tree/main/src/joystick/hidapi/steam). DSU protocol from [v1993/gcemuhook](https://github.com/v1993/gcemuhook). MIT.
 
 # Notice on SDL Native Emulators
 Emulators that support the Controller Nativly like RPCS3 need the Steam Overlay disabled on their Shortcut to stop Steam Input from Injecting and Hiding the Controller.
