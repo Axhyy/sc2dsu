@@ -171,6 +171,7 @@ pub struct OpenSlot {
     last_imu_refresh: Instant,
     gyro_map: config::AxisMap,
     accel_map: config::AxisMap,
+    gyro_sensitivity: f32,
     gyro_cal: GyroCalibration,
     auto_calibrate: bool,
     last_imu_ts_us: Option<u32>,
@@ -199,6 +200,7 @@ impl OpenSlot {
             last_imu_refresh: Instant::now(),
             gyro_map: cfg.gyro,
             accel_map: cfg.accel,
+            gyro_sensitivity: cfg.effective_gyro_sensitivity(),
             gyro_cal: GyroCalibration::new(),
             auto_calibrate: cfg.auto_calibrate,
             last_imu_ts_us: None,
@@ -224,6 +226,7 @@ impl OpenSlot {
             let cfg = config::snapshot();
             self.gyro_map = cfg.gyro;
             self.accel_map = cfg.accel;
+            self.gyro_sensitivity = cfg.effective_gyro_sensitivity();
             self.auto_calibrate = cfg.auto_calibrate;
             self.cfg_generation = live_generation;
             // Bias is estimated in the post-mapping frame; a remap invalidates it.
@@ -261,6 +264,11 @@ impl OpenSlot {
                         state.imu.gyro_dps =
                             self.gyro_cal
                                 .correct(state.imu.gyro_dps, state.imu.accel_g, dt);
+                    }
+                    if self.gyro_sensitivity != 1.0 {
+                        for v in &mut state.imu.gyro_dps {
+                            *v *= self.gyro_sensitivity;
+                        }
                     }
                     stats::publish_calibration(stats::CalibrationSection {
                         active: self.auto_calibrate,

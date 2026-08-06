@@ -50,12 +50,19 @@ impl Default for AxisMap {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Bounds for the user-facing gyro sensitivity multiplier. Anything outside
+// this range is almost certainly a config-file typo rather than a real intent.
+pub const GYRO_SENSITIVITY_MIN: f32 = 0.10;
+pub const GYRO_SENSITIVITY_MAX: f32 = 3.00;
+pub const GYRO_SENSITIVITY_DEFAULT: f32 = 1.00;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub port: u16,
     pub gyro: AxisMap,
     pub accel: AxisMap,
+    pub gyro_sensitivity: f32,
     pub start_minimized: bool,
     pub expose_to_network: bool,
     pub close_to_tray: bool,
@@ -67,11 +74,24 @@ impl Config {
         port: 26760,
         gyro: AxisMap::DEFAULT,
         accel: AxisMap::DEFAULT_ACCEL,
+        gyro_sensitivity: GYRO_SENSITIVITY_DEFAULT,
         start_minimized: false,
         expose_to_network: false,
         close_to_tray: false,
         auto_calibrate: true,
     };
+
+    pub fn effective_gyro_sensitivity(&self) -> f32 {
+        clamp_sensitivity(self.gyro_sensitivity)
+    }
+}
+
+pub fn clamp_sensitivity(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(GYRO_SENSITIVITY_MIN, GYRO_SENSITIVITY_MAX)
+    } else {
+        GYRO_SENSITIVITY_DEFAULT
+    }
 }
 
 impl Default for Config {
@@ -186,11 +206,22 @@ mod tests {
         assert_eq!(parsed.accel, AxisMap::DEFAULT_ACCEL);
         assert!(!parsed.expose_to_network);
         assert!(parsed.auto_calibrate);
+        assert_eq!(parsed.gyro_sensitivity, GYRO_SENSITIVITY_DEFAULT);
     }
 
     #[test]
     fn bind_host_maps_flag() {
         assert_eq!(bind_host(true), "0.0.0.0");
         assert_eq!(bind_host(false), "127.0.0.1");
+    }
+
+    #[test]
+    fn clamp_sensitivity_handles_bounds_and_nan() {
+        assert_eq!(clamp_sensitivity(1.0), 1.0);
+        assert_eq!(clamp_sensitivity(0.0), GYRO_SENSITIVITY_MIN);
+        assert_eq!(clamp_sensitivity(99.0), GYRO_SENSITIVITY_MAX);
+        assert_eq!(clamp_sensitivity(-1.0), GYRO_SENSITIVITY_MIN);
+        assert_eq!(clamp_sensitivity(f32::NAN), GYRO_SENSITIVITY_DEFAULT);
+        assert_eq!(clamp_sensitivity(f32::INFINITY), GYRO_SENSITIVITY_DEFAULT);
     }
 }

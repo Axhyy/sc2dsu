@@ -7,7 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Graphics::Gdi::HDC;
 
 const W: i32 = 540;
-const H: i32 = 810;
+const H: i32 = 830;
+
+// Sensitivity slider stores hundredths (10 = 0.10×, 100 = 1.00×, 300 = 3.00×).
+const SENS_SLIDER_SCALE: f32 = 100.0;
+const SENS_SLIDER_MIN: usize = (config::GYRO_SENSITIVITY_MIN * 100.0) as usize;
+const SENS_SLIDER_MAX: usize = (config::GYRO_SENSITIVITY_MAX * 100.0) as usize;
 
 const AXIS_LABELS: [&str; 3] = ["raw X", "raw Y", "raw Z"];
 
@@ -92,7 +97,7 @@ pub struct App {
     #[nwg_control(parent: status_frame, position: (12, 136), size: (500, 18), text: "accel (g)      [0.000 0.000 0.000]")]
     lbl_accel: nwg::Label,
 
-    #[nwg_control(parent: window, position: (10, 178), size: (W - 20, 136))]
+    #[nwg_control(parent: window, position: (10, 178), size: (W - 20, 156))]
     gyro_frame: nwg::Frame,
     #[nwg_control(parent: gyro_frame, position: (10, 10), size: (260, 18), text: "Gyro axis mapping")]
     lbl_gyro_hdr: nwg::Label,
@@ -100,6 +105,14 @@ pub struct App {
     #[nwg_control(parent: gyro_frame, position: (290, 8), size: (220, 22), text: "Auto-calibrate bias")]
     #[nwg_events(OnButtonClick: [App::on_auto_cal_toggle])]
     chk_auto_cal: nwg::CheckBox,
+
+    #[nwg_control(parent: gyro_frame, position: (12, 122), size: (100, 18), text: "Sensitivity")]
+    lbl_gyro_sens: nwg::Label,
+    #[nwg_control(parent: gyro_frame, position: (114, 118), size: (286, 24))]
+    #[nwg_events(OnHorizontalScroll: [App::on_sensitivity_change])]
+    slider_gyro_sens: nwg::TrackBar,
+    #[nwg_control(parent: gyro_frame, position: (408, 122), size: (100, 18), text: "1.00×")]
+    lbl_gyro_sens_val: nwg::Label,
 
     #[nwg_control(parent: gyro_frame, position: (12, 34), size: (220, 18), text: "DSU X (Eden pitch)")]
     lbl_gx: nwg::Label,
@@ -128,7 +141,7 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_change])]
     chk_gz: nwg::CheckBox,
 
-    #[nwg_control(parent: window, position: (10, 322), size: (W - 20, 156))]
+    #[nwg_control(parent: window, position: (10, 342), size: (W - 20, 156))]
     accel_frame: nwg::Frame,
     #[nwg_control(parent: accel_frame, position: (10, 10), size: (260, 18), text: "Accel axis mapping")]
     lbl_accel_hdr: nwg::Label,
@@ -164,7 +177,7 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_change])]
     chk_az: nwg::CheckBox,
 
-    #[nwg_control(parent: window, position: (10, 486), size: (W - 20, 116))]
+    #[nwg_control(parent: window, position: (10, 506), size: (W - 20, 116))]
     sys_frame: nwg::Frame,
     #[nwg_control(parent: sys_frame, position: (10, 10), size: (260, 18), text: "System")]
     lbl_sys_hdr: nwg::Label,
@@ -195,7 +208,7 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_restore_defaults])]
     btn_restore: nwg::Button,
 
-    #[nwg_control(parent: Some(&data.window), position: (10, 610), size: (W - 20, 152))]
+    #[nwg_control(parent: Some(&data.window), position: (10, 630), size: (W - 20, 152))]
     #[nwg_events(OnPaint: [App::on_viz_paint(SELF, EVT_DATA)])]
     viz_canvas: nwg::ExternCanvas,
 
@@ -233,6 +246,8 @@ impl App {
         ] {
             cb.set_collection(items.clone());
         }
+        self.slider_gyro_sens.set_range_min(SENS_SLIDER_MIN);
+        self.slider_gyro_sens.set_range_max(SENS_SLIDER_MAX);
         self.suppress_change.set(true);
         self.populate_from_config();
         self.suppress_change.set(false);
@@ -263,6 +278,28 @@ impl App {
         self.set_axis_widgets(&cfg.accel.y, &self.cb_ay, &self.chk_ay);
         self.set_axis_widgets(&cfg.accel.z, &self.cb_az, &self.chk_az);
         self.edit_port.set_text(&cfg.port.to_string());
+        self.set_sensitivity_widgets(cfg.effective_gyro_sensitivity());
+    }
+
+    fn set_sensitivity_widgets(&self, sensitivity: f32) {
+        let pos = (sensitivity * SENS_SLIDER_SCALE)
+            .round()
+            .clamp(SENS_SLIDER_MIN as f32, SENS_SLIDER_MAX as f32) as usize;
+        self.slider_gyro_sens.set_pos(pos);
+        self.update_sensitivity_label(pos);
+    }
+
+    fn update_sensitivity_label(&self, pos: usize) {
+        let value = pos as f32 / SENS_SLIDER_SCALE;
+        self.lbl_gyro_sens_val.set_text(&format!("{value:.2}×"));
+    }
+
+    fn read_sensitivity(&self) -> f32 {
+        let pos = self
+            .slider_gyro_sens
+            .pos()
+            .clamp(SENS_SLIDER_MIN, SENS_SLIDER_MAX);
+        pos as f32 / SENS_SLIDER_SCALE
     }
 
     fn set_axis_widgets(
@@ -304,6 +341,26 @@ impl App {
         }
         match config::update_and_save(cfg) {
             Ok(()) => self.lbl_save.set_text(note),
+            Err(e) => self.lbl_save.set_text(&format!("save failed: {e}")),
+        }
+    }
+
+    fn on_sensitivity_change(&self) {
+        let pos = self
+            .slider_gyro_sens
+            .pos()
+            .clamp(SENS_SLIDER_MIN, SENS_SLIDER_MAX);
+        self.update_sensitivity_label(pos);
+        if self.suppress_change.get() {
+            return;
+        }
+        let mut cfg = config::snapshot();
+        cfg.gyro_sensitivity = self.read_sensitivity();
+        match config::update_and_save(cfg) {
+            Ok(()) => self.lbl_save.set_text(&format!(
+                "gyro sensitivity {:.2}×.",
+                pos as f32 / SENS_SLIDER_SCALE
+            )),
             Err(e) => self.lbl_save.set_text(&format!("save failed: {e}")),
         }
     }
