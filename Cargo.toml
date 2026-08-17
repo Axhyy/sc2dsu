@@ -1,6 +1,6 @@
 [package]
 name = "sc2dsu"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Cemuhook DSU server for 2015/2026 Steam Controller and Flydigi Vader 5 Pro motion and inputs."
 license = "MIT"
