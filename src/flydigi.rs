@@ -59,8 +59,10 @@ pub fn pid_label(_pid: u16) -> &'static str {
     "Flydigi Vader 5 Pro"
 }
 
-fn be_i16(b: &[u8]) -> i16 {
-    i16::from_be_bytes([b[0], b[1]])
+// All multi-byte fields in this protocol are little-endian (SDL3's LOAD16(A, B)
+// is `A | (B << 8)`, i.e. the lower frame index is the low byte).
+fn le_i16(b: &[u8]) -> i16 {
+    i16::from_le_bytes([b[0], b[1]])
 }
 
 // Vader 5 Pro's write path uses unnumbered reports: the report-ID byte that
@@ -142,9 +144,10 @@ struct DeviceInfoReply {
 
 fn parse_info_reply(buf: &[u8; PACKET_LEN]) -> Option<DeviceInfoReply> {
     let frame = normalize_frame(buf)?;
+    // SDL3 reads this as LOAD16(data[16], data[15]) = data[16] | (data[15] << 8).
     Some(DeviceInfoReply {
         device_id: frame[5],
-        firmware_version: u16::from_be_bytes([frame[16], frame[15]]),
+        firmware_version: u16::from_le_bytes([frame[16], frame[15]]),
     })
 }
 
@@ -237,27 +240,29 @@ fn parse_input_report(frame: &[u8]) -> Option<ControllerState> {
         buttons |= button::STEAM;
     }
 
-    let left_stick = [be_i16(&frame[3..5]), be_i16(&frame[5..7]).saturating_neg()];
-    let right_stick = [be_i16(&frame[7..9]), be_i16(&frame[9..11]).saturating_neg()];
+    let left_stick = [le_i16(&frame[3..5]), le_i16(&frame[5..7]).saturating_neg()];
+    let right_stick = [le_i16(&frame[7..9]), le_i16(&frame[9..11]).saturating_neg()];
 
     let trigger = |v: u8| ((u32::from(v) * 257).min(i16::MAX as u32)) as u16;
     let trigger_left = trigger(frame[15]);
     let trigger_right = trigger(frame[16]);
 
-    // Big-endian raw axes, full int16 range mapped to +/-2000 dps and +/-1 g
+    // Little-endian raw axes, full int16 range mapped to +/-2000 dps and +/-1 g
     // (accelScale = STANDARD_GRAVITY/4096 in SDL3, i.e. 4096 counts per g).
+    // Negate after scaling to f32 (matching SDL's own float negation) rather
+    // than negating the raw i16, which would panic on overflow at i16::MIN.
     let to_dps = |v: i16| (f32::from(v) / 32768.0) * 2000.0;
     let to_g = |v: i16| f32::from(v) / 4096.0;
 
-    let gyro_x = be_i16(&frame[17..19]);
-    let gyro_z = be_i16(&frame[19..21]);
-    let gyro_y = be_i16(&frame[21..23]);
-    let gyro_dps = [to_dps(gyro_x), to_dps(gyro_y), to_dps(-gyro_z)];
+    let gyro_x = le_i16(&frame[17..19]);
+    let gyro_z = le_i16(&frame[19..21]);
+    let gyro_y = le_i16(&frame[21..23]);
+    let gyro_dps = [to_dps(gyro_x), to_dps(gyro_y), -to_dps(gyro_z)];
 
-    let accel_x = be_i16(&frame[23..25]);
-    let accel_z = be_i16(&frame[25..27]);
-    let accel_y = be_i16(&frame[27..29]);
-    let accel_g = [to_g(accel_x), to_g(accel_y), to_g(-accel_z)];
+    let accel_x = le_i16(&frame[23..25]);
+    let accel_z = le_i16(&frame[25..27]);
+    let accel_y = le_i16(&frame[27..29]);
+    let accel_g = [to_g(accel_x), to_g(accel_y), -to_g(accel_z)];
 
     Some(ControllerState {
         buttons,
@@ -409,22 +414,22 @@ mod tests {
         f[0] = MAGIC1;
         f[1] = MAGIC2;
         f[2] = CMD_INPUT_REPORT;
-        f[3..5].copy_from_slice(&left[0].to_be_bytes());
-        f[5..7].copy_from_slice(&(-left[1]).to_be_bytes());
-        f[7..9].copy_from_slice(&right[0].to_be_bytes());
-        f[9..11].copy_from_slice(&(-right[1]).to_be_bytes());
+        f[3..5].copy_from_slice(&left[0].to_le_bytes());
+        f[5..7].copy_from_slice(&(-left[1]).to_le_bytes());
+        f[7..9].copy_from_slice(&right[0].to_le_bytes());
+        f[9..11].copy_from_slice(&(-right[1]).to_le_bytes());
         f[11] = buttons_11_14[0];
         f[12] = buttons_11_14[1];
         f[13] = buttons_11_14[2];
         f[14] = buttons_11_14[3];
         f[15] = triggers[0];
         f[16] = triggers[1];
-        f[17..19].copy_from_slice(&gyro_raw[0].to_be_bytes());
-        f[19..21].copy_from_slice(&(-gyro_raw[2]).to_be_bytes());
-        f[21..23].copy_from_slice(&gyro_raw[1].to_be_bytes());
-        f[23..25].copy_from_slice(&accel_raw[0].to_be_bytes());
-        f[25..27].copy_from_slice(&(-accel_raw[2]).to_be_bytes());
-        f[27..29].copy_from_slice(&accel_raw[1].to_be_bytes());
+        f[17..19].copy_from_slice(&gyro_raw[0].to_le_bytes());
+        f[19..21].copy_from_slice(&(-gyro_raw[2]).to_le_bytes());
+        f[21..23].copy_from_slice(&gyro_raw[1].to_le_bytes());
+        f[23..25].copy_from_slice(&accel_raw[0].to_le_bytes());
+        f[25..27].copy_from_slice(&(-accel_raw[2]).to_le_bytes());
+        f[27..29].copy_from_slice(&accel_raw[1].to_le_bytes());
         f
     }
 
@@ -485,8 +490,8 @@ mod tests {
         buf[1] = MAGIC2;
         buf[2] = CMD_GET_INFO;
         buf[5] = DEVICE_ID_VADER5_PRO;
-        buf[15] = 0x41;
-        buf[16] = 0x71;
+        buf[15] = 0x71;
+        buf[16] = 0x41;
         let info = parse_info_reply(&buf).unwrap();
         assert_eq!(info.device_id, DEVICE_ID_VADER5_PRO);
         assert_eq!(info.firmware_version, MIN_FIRMWARE_VADER5_PRO);
