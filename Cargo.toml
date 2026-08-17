@@ -2,7 +2,7 @@
 name = "sc2dsu"
 version = "0.2.0"
 edition = "2024"
-description = "Cemuhook DSU server for 2015 and 2026 Steam Controller motion and inputs."
+description = "Cemuhook DSU server for 2015/2026 Steam Controller and Flydigi Vader 5 Pro motion and inputs."
 license = "MIT"
 repository = "https://github.com/NightHammer1000/sc2dsu"
 readme = "README.md"

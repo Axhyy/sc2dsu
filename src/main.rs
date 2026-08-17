@@ -2,7 +2,10 @@
 
 mod autostart;
 mod config;
+mod controller;
+mod device;
 mod dsu;
+mod flydigi;
 mod gyro_calibration;
 mod probe;
 mod stats;
@@ -87,7 +90,7 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
     let dsu_wants_device = Arc::new(AtomicBool::new(false));
     let ui_wants_device = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel::<triton::DeviceEvent>(SAMPLE_QUEUE_LEN);
+    let (tx, rx) = sync_channel::<controller::DeviceEvent>(SAMPLE_QUEUE_LEN);
 
     let device_handle = {
         let dsu_wants = dsu_wants_device.clone();
@@ -134,7 +137,7 @@ fn run_device_thread(
     dsu_wants: Arc<AtomicBool>,
     ui_wants: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    tx: SyncSender<triton::DeviceEvent>,
+    tx: SyncSender<controller::DeviceEvent>,
 ) {
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
@@ -169,18 +172,18 @@ fn run_device_thread(
                     }
                 }
             }
-            for info in triton::list_candidates(&api) {
+            for info in device::list_candidates(&api) {
                 let path = info.path().to_bytes().to_vec();
                 if controllers.iter().any(|controller| controller.path == path) {
                     continue;
                 }
-                match triton::OpenSlot::open(&api, &info) {
+                match device::OpenSlot::open(&api, &info) {
                     Ok(device) => {
                         eprintln!(
                             "controller: opened iface {} (PID {:04X} {})",
-                            device.interface_number,
-                            device.product_id,
-                            triton::pid_label(device.product_id),
+                            device.interface_number(),
+                            device.product_id(),
+                            device.label(),
                         );
                         controllers.push(ManagedController {
                             path,
@@ -217,7 +220,7 @@ fn run_device_thread(
 
 struct ManagedController {
     path: Vec<u8>,
-    device: triton::OpenSlot,
+    device: device::OpenSlot,
     dsu_slot: Option<u8>,
     last_sample_at: Instant,
     consecutive_errors: u32,
@@ -227,12 +230,12 @@ struct ManagedController {
 
 fn poll_controllers(
     controllers: &mut Vec<ManagedController>,
-    tx: &SyncSender<triton::DeviceEvent>,
+    tx: &SyncSender<controller::DeviceEvent>,
 ) {
     const SILENCE_REOPEN_MS: u128 = 2000;
     const STALE_THRESHOLD: u32 = 100;
 
-    let mut occupied = [false; triton::MAX_CONTROLLERS];
+    let mut occupied = [false; controller::MAX_CONTROLLERS];
     for controller in controllers.iter() {
         if let Some(slot) = controller.dsu_slot {
             occupied[usize::from(slot)] = true;
@@ -273,8 +276,8 @@ fn poll_controllers(
                                 controllers[index].dsu_slot = Some(slot);
                                 eprintln!(
                                     "controller: assigned PID {:04X} iface {} to DSU slot {}",
-                                    controllers[index].device.product_id,
-                                    controllers[index].device.interface_number,
+                                    controllers[index].device.product_id(),
+                                    controllers[index].device.interface_number(),
                                     slot
                                 );
                             }
@@ -282,7 +285,7 @@ fn poll_controllers(
                         }
                     };
                     if let Some(slot) = dsu_slot {
-                        let _ = tx.try_send(triton::DeviceEvent::Sample {
+                        let _ = tx.try_send(controller::DeviceEvent::Sample {
                             slot,
                             state: sample,
                         });
@@ -308,7 +311,7 @@ fn poll_controllers(
             let controller = controllers.remove(index);
             if let Some(slot) = controller.dsu_slot {
                 occupied[usize::from(slot)] = false;
-                let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
+                let _ = tx.send(controller::DeviceEvent::Disconnected { slot });
                 eprintln!("controller: DSU slot {slot} disconnected");
             }
         } else {
@@ -317,10 +320,13 @@ fn poll_controllers(
     }
 }
 
-fn disconnect_all(controllers: &mut Vec<ManagedController>, tx: &SyncSender<triton::DeviceEvent>) {
+fn disconnect_all(
+    controllers: &mut Vec<ManagedController>,
+    tx: &SyncSender<controller::DeviceEvent>,
+) {
     for controller in controllers.drain(..) {
         if let Some(slot) = controller.dsu_slot {
-            let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
+            let _ = tx.send(controller::DeviceEvent::Disconnected { slot });
         }
     }
 }

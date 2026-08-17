@@ -1,4 +1,6 @@
-use crate::triton::{self, ControllerState, OpenSlot};
+use crate::controller::ControllerState;
+use crate::device::{self, OpenSlot};
+use crate::{flydigi, triton};
 use hidapi::HidApi;
 use std::time::{Duration, Instant};
 
@@ -26,14 +28,33 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let candidates = triton::list_candidates(&api);
+    println!("\n=== All Flydigi (VID 0x37D7) HID interfaces ===");
+    for d in api
+        .device_list()
+        .filter(|d| d.vendor_id() == flydigi::VID_FLYDIGI_V2)
+    {
+        let cand = flydigi::is_candidate(d);
+        let mark = if cand { "  <-- candidate" } else { "" };
+        println!(
+            "  PID {:04X} iface={:>2} usage_page=0x{:04X} usage=0x{:04X} serial={:?} product={:?}{}",
+            d.product_id(),
+            d.interface_number(),
+            d.usage_page(),
+            d.usage(),
+            d.serial_number().unwrap_or(""),
+            d.product_string().unwrap_or(""),
+            mark
+        );
+    }
+
+    let candidates = device::list_candidates(&api);
     println!("\n=== {} candidate interface(s) ===", candidates.len());
     for info in &candidates {
         println!(
             "\n>>> trying iface {} of PID {:04X} ({})",
             info.interface_number(),
             info.product_id(),
-            triton::pid_label(info.product_id())
+            device::pid_label(info)
         );
         match OpenSlot::open(&api, info) {
             Ok(slot) => probe_one(slot),
@@ -46,7 +67,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn probe_one(mut slot: OpenSlot) {
     println!(
         "    open + init ok (iface {}, PID {:04X}); reading 3 s ...",
-        slot.interface_number, slot.product_id
+        slot.interface_number(),
+        slot.product_id()
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut frames_seen = 0u32;
@@ -69,7 +91,7 @@ fn probe_one(mut slot: OpenSlot) {
     }
     println!(
         "    --- 3 s summary: {} raw input reports, {frames_seen} STATE frames decoded ---",
-        slot.input_reports_seen
+        slot.input_reports_seen()
     );
 }
 

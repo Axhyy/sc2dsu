@@ -39,7 +39,7 @@ pub struct App {
     #[nwg_control(
         size: (W, H),
         position: (300, 200),
-        title: "SC2DSU — Steam Controller gyro to Cemuhook",
+        title: "SC2DSU — Controller gyro to Cemuhook",
         flags: "WINDOW|VISIBLE|MINIMIZE_BOX"
     )]
     #[nwg_events(OnWindowClose: [App::on_close(SELF, EVT_DATA)], OnInit: [App::on_init])]

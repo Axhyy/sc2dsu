@@ -1,6 +1,6 @@
 use crate::config;
+use crate::controller::{self, ControllerState, DeviceEvent};
 use crate::stats;
-use crate::triton::{self, ControllerState, DeviceEvent};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::net::{SocketAddr, UdpSocket};
@@ -44,7 +44,7 @@ mod connection_type {
 }
 const BATTERY_NA: u8 = 0;
 
-const MAX_SLOTS: usize = triton::MAX_CONTROLLERS;
+const MAX_SLOTS: usize = controller::MAX_CONTROLLERS;
 
 fn slot_mac(slot: u8) -> [u8; 6] {
     [0x02, 0x28, 0xDE, 0x13, 0x04, slot]
@@ -476,7 +476,7 @@ fn write_data_body(body: &mut [u8], state: &ControllerState) {
     let pressed = |mask: u32| state.buttons & mask != 0;
     let full = |on: bool| if on { u8::MAX } else { 0 };
     let analog: [u8; 12] = {
-        use triton::button as bt;
+        use controller::button as bt;
         [
             full(pressed(bt::DPAD_LEFT)),
             full(pressed(bt::DPAD_DOWN)),
@@ -511,7 +511,7 @@ fn write_data_body(body: &mut [u8], state: &ControllerState) {
 }
 
 fn dsu_button_bytes(buttons: u32, l2_down: bool, r2_down: bool) -> [u8; 4] {
-    use triton::button as bt;
+    use controller::button as bt;
     let down = |mask: u32| buttons & mask != 0;
     let buttons1 = pack_bits(&[
         (down(bt::MENU), 0),
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn dsu_button_bytes_maps_buttons_to_correct_bits() {
-        use crate::triton::button as bt;
+        use crate::controller::button as bt;
         let bit = |n: u8| 1u8 << n;
         let [b1, b2, home, touch] = dsu_button_bytes(bt::A | bt::DPAD_UP | bt::STEAM, false, false);
         assert_eq!(b1, bit(4));
@@ -686,12 +686,12 @@ mod tests {
     fn data_body_encodes_buttons_sticks_and_motion() {
         let mut body = vec![0u8; 80];
         let state = ControllerState {
-            buttons: triton::button::B | triton::button::DPAD_LEFT,
+            buttons: controller::button::B | controller::button::DPAD_LEFT,
             trigger_left: 0x7FFF,
             trigger_right: 0,
             left_stick: [i16::MAX, i16::MIN],
             right_stick: [0, 0],
-            imu: triton::ImuSample {
+            imu: controller::ImuSample {
                 timestamp_us: 0xABCD_1234,
                 accel_g: [0.25, -0.5, 1.0],
                 gyro_dps: [10.0, -20.0, 30.0],
@@ -727,7 +727,7 @@ mod tests {
             trigger_right: 0,
             left_stick: [0, 0],
             right_stick: [0, 0],
-            imu: triton::ImuSample {
+            imu: controller::ImuSample {
                 timestamp_us: 0,
                 accel_g: [0.0; 3],
                 gyro_dps: [0.0; 3],
@@ -821,7 +821,7 @@ mod tests {
             trigger_right: 0,
             left_stick: [0; 2],
             right_stick: [0; 2],
-            imu: triton::ImuSample {
+            imu: controller::ImuSample {
                 timestamp_us: 1,
                 accel_g: [0.0; 3],
                 gyro_dps: [0.0; 3],
